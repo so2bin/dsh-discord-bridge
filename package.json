@@ -1,0 +1,58 @@
+{
+  "name": "dsh-discord-bridge",
+  "version": "0.1.0",
+  "description": "Bidirectional Discord bridge for DeepSeek Harness (DSH): mirror a Harness session into a Discord channel, send instructions from your phone, and receive inbound images as real DSH attachments.",
+  "icon": "./icon.svg",
+  "license": "MIT",
+  "author": "so2bin",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "discord.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "discord",
+    "discord-bot",
+    "bridge"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/so2bin/dsh-discord-bridge.git"
+  },
+  "homepage": "https://github.com/so2bin/dsh-discord-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/so2bin/dsh-discord-bridge/issues"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "https-proxy-agent": "^7.0.6",
+    "ws": "^8.18.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

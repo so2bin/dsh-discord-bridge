@@ -1,0 +1,11 @@
+# discord-bridge bundle patch: mount the Host plugin under its package name.
+# Config lives on this row; replace the whole `config` map when overriding it
+# from the profile's own cordis.patch.yml.
+- insert:
+    - id: discord-bridge
+      name: dsh-discord-bridge
+      config:
+        botToken: ''
+        channelId: ''
+        proxy: ''
+        sessionId: ''

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Discord Session Bridge",
+    "description": "Mirror one Harness session into a Discord channel and take new instructions from your phone: assistant replies, tool calls and turn outcomes are pushed out, messages typed in the channel become real user prompts on that same session."
+  }
+}
