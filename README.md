@@ -1,165 +1,185 @@
 # dsh-discord-bridge
 
-> **English summary**: A Cordis/DSH host plugin that bridges a
-> [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (DSH) session
-> to a Discord text channel. Assistant replies and turn outcomes are pushed to
-> Discord; messages typed in the channel become real user prompts on the same
-> session. Inbound PNG/JPEG/WebP/GIF images are admitted as DSH attachments.
-> Not affiliated with DeepSeek or Discord.
+[简体中文](./README.md) | [English](./README.en.md)
 
-把 DeepSeek Harness（DSH）会话接到 Discord：**按需**给某个会话开一个专属频道，手机上就能看它的实时进度、下指令、开新会话。
+把 **DeepSeek Harness（DSH）** 的会话接到 Discord：在 Discord 频道里和你的 DSH 会话对话，助手回复和每一轮结果会同步到 Discord；在频道里发消息，就等于给同一个会话下指令。
 
-- **同步是开关，不是默认**：会话默认不推任何东西；`!sync` 才给它建专属频道并开始同步，`!unsync` 关掉。
-- **往外推**：助手回复、每一轮的结束（✅/⏹/❌），都从 `session/event` 里取，不做二次加工；工具调用默认不推（`pushTools: false`）。
-- **往里收**：频道里发的文本会变成那个会话真实的一条 user message（`agent.followup()`），和你在界面里打字完全等价。
-- **PC 端发起的对话一样推**：推送绑定的是会话 id，和你在哪个窗口打字无关。
-- **删频道 ≠ 删会话**：频道被删只会解除绑定；要归档会话必须显式发 `!archive`。
-- 会话日志仍是唯一事实来源：插件不新增事件类型，也不落自己的对话状态。
+适合这些场景：
 
-## 安装
+- 人不在电脑前，用手机在 Discord 里继续 DSH 的任务；
+- 给每个会话开一个专属频道，随时看它跑到哪一步；
+- 从 Discord 直接新建会话、发指令、发图片；
+- 电脑端和 Discord 端共用同一个会话，不用复制粘贴上下文。
 
-要求：Node.js **22.12+**，已有一个可用的 DSH profile。
+> 本项目与 DeepSeek、Discord 没有隶属关系。
 
-### 从 GitHub 安装
+## 开始前
+
+- 已经安装并能启动 DSH（桌面端或 `dsh web`）；
+- 有一个 Discord 服务器，你有创建 Bot、管理频道的权限；
+- 如果你的网络需要代理才能访问 Discord，先准备好代理地址。
+
+## 1. 安装插件
 
 ```bash
 dsh plugin --profile <profile> add github:so2bin/dsh-discord-bridge
 ```
 
-### 本地开发
+把 `<profile>` 换成你的 DSH profile：桌面端通常是 `desktop`，`dsh web` 通常是 `web`。
 
-```bash
-git clone https://github.com/so2bin/dsh-discord-bridge.git
-cd dsh-discord-bridge
-npm install
-npm test
-dsh plugin --profile <profile> add /absolute/path/to/dsh-discord-bridge
+安装完成后重启 DSH，或在 DSH 里重新加载该 profile。
+
+## 2. 创建 Discord Bot
+
+1. 打开 <https://discord.com/developers/applications> → **New Application**。
+2. 左侧 **Bot** → **Reset Token**，复制生成的 token（只显示一次，先保存好）。
+3. 同一页打开 **Privileged Gateway Intents → MESSAGE CONTENT INTENT**，否则 bot 收不到消息内容。
+4. 左侧 **OAuth2 → URL Generator**：
+   - Scopes 勾选 `bot`；
+   - Bot Permissions 勾选 `View Channels`、`Send Messages`、`Read Message History`、`Embed Links`；
+   - 想让 bot 自动建专属频道（`!sync`）时，再勾 `Manage Channels`。
+5. 打开生成的邀请链接，把 bot 拉进你的服务器。
+6. 在 Discord 设置 → **高级 → 开发者模式** 打开后，右键频道/服务器 → **复制频道 ID / 服务器 ID**，后面配置会用到。
+
+## 3. 配置
+
+编辑你的 profile 配置文件：
+
+```text
+~/.dsh/profiles/<profile>/cordis.patch.yml
 ```
 
-安装后重启该 profile，或让 DSH 热重载插件。插件运行在 DSH Host 进程里，不需要单独的 bot 进程。
-
-## 配置
-
-在 profile 的 `cordis.patch.yml` 里增加/覆盖 `discord-bridge` 配置行：
+加入或覆盖 `discord-bridge` 这一行：
 
 ```yaml
 - id: discord-bridge
   config:
-    botToken: ''                 # 或使用 DISCORD_BOT_TOKEN 环境变量
-    channelId: ''                # 绑定频道 / 上线问候语频道
-    proxy: ''                    # 或使用 DISCORD_PROXY
-    sessionId: ''
-    newSessionCwd: ''
-    dedicatedChannels: true
-    autoRename: true
-    guildId: ''
-    allowUserIds: []
-    allowChannelIds: []
-    pushAssistant: true
-    pushTools: false
-    pushTurnEnd: true
-    pushTyping: true
-    replyToPrompt: true
-    storeFile: ''
+    botToken: '你的 Bot Token'
+    channelId: '接收上线通知的频道 ID'
+    proxy: ''                    # 需要代理时填 http://127.0.0.1:7890
+    dedicatedChannels: true      # 允许 !sync 自动建专属频道
+    guildId: '你的服务器 ID'      # 可留空；多个服务器时建议填
 ```
 
-**不要把真实 token 写进公开仓库。** 推荐只写空 `botToken`，用环境变量注入：
+不想把 token 写进文件时，可以改用环境变量（设置后需要重启 DSH）：
 
-```bash
-export DISCORD_BOT_TOKEN='...'
-export DISCORD_PROXY='http://127.0.0.1:7890'
+```powershell
+$env:DISCORD_BOT_TOKEN = '你的 Bot Token'
+$env:DISCORD_PROXY = 'http://127.0.0.1:7890'
 ```
 
-| 字段 | 说明 |
+常用配置：
+
+| 配置 | 作用 |
 |---|---|
-| `botToken` | Discord Bot Token。**必需**（也可用 `DISCORD_BOT_TOKEN`） |
-| `dedicatedChannels` | 允许 `!sync` 建专属频道（需要 bot 有「管理频道」权限） |
-| `guildId` | 建频道所在的服务器；留空则取网关里第一个服务器 |
-| `channelCategoryId` | 新频道放进哪个分类（可选） |
-| `channelNamePrefix` | 频道名前缀，默认空 |
-| `autoRename` | 会话标题出来时自动改一次频道名 |
-| `channelId` | 上线问候语发到哪个频道 |
-| `proxy` | 访问 Discord 的代理，例如 `http://127.0.0.1:7890`（也可用 `DISCORD_PROXY`） |
-| `newSessionCwd` | `!new` 建会话的工作目录 |
-| `allowUserIds` / `allowChannelIds` | 白名单；空 = 不限制 |
-| `pushAssistant` / `pushTools` / `pushTurnEnd` / `pushTyping` | 推送开关 |
-| `storeFile` | 绑定表位置，默认 `$DSH_HOME/plugins/dsh-discord-bridge.json` |
+| `botToken` | Discord Bot Token，必填；也可用 `DISCORD_BOT_TOKEN` |
+| `channelId` | 上线通知发到哪个频道；留空则用第一个已绑定频道 |
+| `proxy` | 访问 Discord 的代理；也可用 `DISCORD_PROXY` |
+| `dedicatedChannels` | 是否允许 `!sync` 自动建专属频道，默认 `false` |
+| `guildId` | 建频道所在的服务器；留空取第一个服务器 |
+| `allowUserIds` | 允许使用 bot 的 Discord 用户 ID；空 = 不限制 |
+| `allowChannelIds` | 允许使用的频道 ID；空 = 不限制 |
+| `pushTools` | 是否把工具调用也推到 Discord，默认 `false` |
+| `newSessionCwd` | `!new` 新建会话时使用的工作目录 |
+| `autoRename` | 会话有标题后自动改专属频道名，默认 `true` |
 
-## Discord 侧准备
+保存后重启 DSH。bot 上线时会在 `channelId` 对应的频道发一条上线消息。
 
-1. https://discord.com/developers/applications → New Application → Bot → Reset Token。
-2. **Privileged Gateway Intents → 打开 `MESSAGE CONTENT INTENT`**（否则收到的消息内容为空）。
-3. OAuth2 URL Generator：scopes 勾 `bot`，权限勾 `Send Messages` / `Read Message History` / `View Channels` 把 bot 拉进服务器。
-4. 服务器设置 → 角色 → 给 bot 的角色加上 **管理频道**（`!sync` 建频道用）。
-5. 频道 ID 可以让 bot 自己报：`!here`。
+## 4. 开始使用
 
-## 同步开关
+### 绑定一个已有会话
 
-| 动作 | 效果 |
-|---|---|
-| `!sync [序号\|id前缀]` | 给该会话建专属频道（名字取会话标题，topic 记 `dsh:<sessionId>`）并开启同步；不带参数 = 当前频道绑定的会话 |
-| `!unsync` | 关闭本频道同步；如果这是插件自动建的专属频道，会把它一并删掉 |
-| 在 Discord 里直接删频道 | 只解除绑定，会话完全不受影响 |
-| `!archive` | 显式归档本频道绑定的会话（DSH 的"删除会话"就是归档） |
-
-专属频道会在标题生成后自动改名一次（`autoRename`）。
-
-## 命令
-
-| 输入 | 作用 |
-|---|---|
-| 任意文本 | 作为新指令交给本频道绑定的会话 |
-| `!status` | 会话看板（标题 + 工作区 + 状态 + id，附一键绑定按钮） |
-| `!use 2` / `!use <id 前缀>` | 把本频道绑到那个会话（多会话手动切换时用） |
-| `!sync` / `!unsync` | 开 / 关专属频道同步 |
-| `!new [首条指令]` | 新建会话并绑定本频道 |
-| `!archive` | 归档本频道绑定的会话 |
-| `!unbind` / `!id` / `!here` / `!help` | 解绑 / 当前绑定 / 频道 id / 帮助 |
-
-## 入站图片
-
-Discord 消息里的 **PNG / JPEG / WebP / GIF** 会经配置的代理下载，按 magic bytes 校验格式，再通过 DSH 的 `ctx.attachments.saveImage` 写成 durable image reference，作为真正的 `image` 消息块交给绑定会话。纯图片消息（没有文字）也会被转发，不再被丢弃。
-
-- 单条数量/大小沿用 DSH 的 attachment 限制；超限、格式不支持或下载失败会跳过，并在频道里提示「图片没有传进来」。
-- 其他附件（PDF / zip / 视频等）暂不转发。
-- 模型能不能"看懂"图片取决于当前会话模型是否支持视觉；纯文本模型只会拿到 DSH 生成的图片占位文本/路径，需要视觉模型或读图工具才能理解画面内容。
-
-## 安全
-
-- **Bot token 等价于密码**。不要提交到仓库、截图或发到聊天里；泄露后立刻在 Discord Developer Portal 重置。
-- 优先使用 `DISCORD_BOT_TOKEN` 环境变量，而不是把 token 写进 profile 文件。
-- `allowUserIds` / `allowChannelIds` 为空表示**服务器内不限制**。多人服务器建议填白名单。
-- 插件运行在 DSH Host 进程里，拥有 DSH 的工具与会话权限。建议使用专用 Discord 服务器/专用 bot，不要把它当公网多租户服务。
-- 安全问题请通过 GitHub 的 **Security → Report a vulnerability** 私下报告，不要公开 issue。
-
-## 已知限制
-
-- 审批卡片（approval）与提问问卷（user questions）目前**不会**转发到 Discord。
-- 工具调用默认不推送；需要时把 `pushTools` 打开。
-- 非图片附件暂不转发。
-- 入站图片能否被模型理解，取决于当前会话模型是否支持视觉。
-
-## 开发
-
-```bash
-npm install
-npm test
-```
-
-项目结构：
+在 Discord 频道里发：
 
 ```text
-dsh-discord-bridge/
-├── index.js             # Cordis 插件入口：会话绑定、命令、入站/出站
-├── discord.js           # 轻量 Discord REST + Gateway 客户端
-├── cordis.patch.yml     # bundle 默认挂载与空配置
-├── locale/              # en / zh 文案
-├── test/                # node:test 单元测试
-├── icon.svg
-├── README.md
-├── SECURITY.md
-└── LICENSE
+!status
 ```
+
+bot 会列出当前 DSH 会话。点击按钮，或按提示发：
+
+```text
+!use 2
+```
+
+把这个频道绑定到第 2 个会话。之后在这个频道里发的任何文字，都会作为该会话的新指令。
+
+### 从 Discord 新建会话
+
+```text
+!new 帮我整理今天的工作记录
+```
+
+会新建一个 DSH 会话并自动绑定当前频道。
+
+### 给会话开专属频道
+
+```text
+!sync
+```
+
+给当前绑定的会话创建一个专属频道，会话的进展会同步到那里。需要配置 `dedicatedChannels: true`，并给 bot `Manage Channels` 权限。
+
+关闭同步：
+
+```text
+!unsync
+```
+
+### 发图片
+
+直接在 Discord 里发送图片（PNG / JPEG / WebP / GIF），可以只发图，也可以图 + 文字。图片会作为附件传给绑定的 DSH 会话。
+
+模型能不能看懂图片取决于当前会话模型是否支持视觉；纯文本模型只能拿到图片占位信息。
+
+### 常用命令
+
+| 命令 | 作用 |
+|---|---|
+| `!status` | 查看会话列表并绑定 |
+| `!use <序号或 id 前缀>` | 把当前频道绑到指定会话 |
+| `!new [首条指令]` | 新建会话并绑定当前频道 |
+| `!sync` / `!unsync` | 开 / 关专属频道同步 |
+| `!archive` | 归档当前频道绑定的会话 |
+| `!unbind` | 解除当前频道的绑定 |
+| `!id` | 查看当前频道绑定的会话 id |
+| `!here` | 查看当前频道 id |
+| `!help` | 查看帮助 |
+
+## 常见问题
+
+**bot 在线，但发消息没反应**
+
+- 确认已经打开 `MESSAGE CONTENT INTENT`；
+- 确认 bot 有 `View Channels`、`Send Messages`、`Read Message History` 权限；
+- 如果配置了代理，确认代理可用；
+- 如果填了 `allowUserIds` / `allowChannelIds`，确认你的 ID 在白名单里。
+
+**`!status` 有响应，但普通消息不回复**
+
+先发 `!status` 确认频道已经绑定到某个会话；没绑定时可以用 `!use <序号>` 或 `!new`。
+
+**`!sync` 没反应或报权限错误**
+
+- 配置里设置 `dedicatedChannels: true`；
+- 给 bot 的服务器角色加上 `Manage Channels`；
+- 多服务器时填写 `guildId`。
+
+**图片没有传进来**
+
+- 只支持 PNG / JPEG / WebP / GIF；
+- 检查图片大小是否超过 DSH 的附件限制；
+- 如果使用代理，确认图片能通过代理下载；
+- 纯文本模型可能只能看到图片占位信息，需要视觉模型。
+
+**审批和提问会同步到 Discord 吗？**
+
+目前不会。工具审批、`ask_user_question` 这类交互仍然在 DSH 界面里完成。
+
+## 安全建议
+
+- Discord Bot Token 等价于密码，不要提交到公开仓库、截图或发到聊天里；泄露后立刻在 Discord Developer Portal 重置。
+- 多人服务器建议配置 `allowUserIds` / `allowChannelIds`，只允许自己使用。
+- 插件运行在 DSH 里，拥有 DSH 的工具与会话权限；建议使用专用服务器和专用 bot。
 
 ## License
 
