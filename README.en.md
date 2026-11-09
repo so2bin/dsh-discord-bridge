@@ -59,6 +59,8 @@ Add or override the `discord-bridge` entry:
     proxy: ''                    # e.g. http://127.0.0.1:7890 if needed
     dedicatedChannels: true      # allow !sync to create channels
     guildId: 'YOUR_SERVER_ID'    # optional; recommended with multiple servers
+    relayQuestions: true         # forward questions to Discord
+    relayApprovals: true         # forward approvals to Discord
 ```
 
 To avoid putting the token in a file, use environment variables instead (restart DSH after setting them):
@@ -82,6 +84,7 @@ Common options:
 | `pushTools` | Also push tool calls to Discord; default `false` |
 | `newSessionCwd` | Working directory for sessions created with `!new` |
 | `autoRename` | Rename a dedicated channel after the session title; default `true` |
+| `relayQuestions` / `relayApprovals` | Forward questions / approvals to Discord; default `true` |
 
 Save the file and restart DSH. When the bot connects, it posts an online notice in `channelId`.
 
@@ -149,6 +152,16 @@ In a channel bound to a session, send files from the remote machine to Discord:
 - The current limit follows Discord's **10 MB** upload cap for unboosted servers; larger files are refused with a hint to compress or transcode.
 - Discord does not render Markdown tables; `!show` displays them as raw pipe-separated text.
 
+## Remote questions and approvals
+
+When a bound session calls `ask_user_question` or requests tool approval, the bridge sends the question and buttons to the corresponding Discord channel:
+
+- **Questions**: click an option, or reply with its number/text; multiple questions are sent one at a time.
+- **Approvals**: click **Allow** or **Deny**.
+- After answering, the local DSH popup closes and the task continues.
+- Only **bound channels** receive these prompts; unbound sessions still use the local DSH UI.
+- Set `relayQuestions` / `relayApprovals` to `false` to opt out.
+
 ### Commands
 
 | Command | Purpose |
@@ -193,7 +206,7 @@ Send `!status` and confirm the channel is bound to a session. If not, use `!use 
 
 **Are approvals and questions forwarded to Discord?**
 
-Not yet. Tool approvals and `ask_user_question` interactions still happen in the DSH UI.
+Yes. Bound channels receive the question/approval buttons automatically; after you click or reply, the local DSH popup closes and the task continues. Unbound sessions still use the local DSH UI.
 
 ## Security
 

@@ -59,6 +59,8 @@ dsh plugin --profile <profile> add github:so2bin/dsh-discord-bridge
     proxy: ''                    # 需要代理时填 http://127.0.0.1:7890
     dedicatedChannels: true      # 允许 !sync 自动建专属频道
     guildId: '你的服务器 ID'      # 可留空；多个服务器时建议填
+    relayQuestions: true         # 把提问转发到 Discord
+    relayApprovals: true         # 把审批转发到 Discord
 ```
 
 不想把 token 写进文件时，可以改用环境变量（设置后需要重启 DSH）：
@@ -82,6 +84,7 @@ $env:DISCORD_PROXY = 'http://127.0.0.1:7890'
 | `pushTools` | 是否把工具调用也推到 Discord，默认 `false` |
 | `newSessionCwd` | `!new` 新建会话时使用的工作目录 |
 | `autoRename` | 会话有标题后自动改专属频道名，默认 `true` |
+| `relayQuestions` / `relayApprovals` | 是否把提问 / 审批转发到 Discord，默认 `true` |
 
 保存后重启 DSH。bot 上线时会在 `channelId` 对应的频道发一条上线消息。
 
@@ -149,6 +152,16 @@ Discord 入站目前只处理图片；PDF / zip / 视频等附件不会自动进
 - 当前按 Discord 未加成服务器的 **10 MB** 上传上限处理；超过会提示先压缩或转码。
 - Discord 不渲染 Markdown 表格，`!show` 表格会以原始竖线文本显示。
 
+## 远程审批与提问
+
+当绑定会话触发 `ask_user_question` 或工具审批时，bridge 会把问题和按钮发到对应 Discord 频道：
+
+- **提问**：点选项按钮，或直接回复序号/文字；多道题会逐条发送。
+- **审批**：点「允许」或「拒绝」。
+- 回答后 DSH 本地的弹窗会自动关闭，任务继续执行。
+- 只对**已绑定频道**生效；没有绑定会话时仍然走 DSH 本地弹窗。
+- 不想转发时，把 `relayQuestions` / `relayApprovals` 设为 `false`。
+
 ### 常用命令
 
 | 命令 | 作用 |
@@ -193,7 +206,7 @@ Discord 入站目前只处理图片；PDF / zip / 视频等附件不会自动进
 
 **审批和提问会同步到 Discord 吗？**
 
-目前不会。工具审批、`ask_user_question` 这类交互仍然在 DSH 界面里完成。
+会。已绑定频道会自动收到问题/审批按钮；点选或回复文字后，DSH 本地弹窗会关闭并继续。没有绑定会话的交互仍然只在 DSH 本地界面出现。
 
 ## 安全建议
 

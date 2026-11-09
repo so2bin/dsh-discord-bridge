@@ -44,6 +44,10 @@ const DEFAULTS = {
   channelCategoryId: '',
   channelNamePrefix: '',
   label: 'DSH',
+  relayQuestions: true,
+  relayApprovals: true,
+  questionTimeoutMs: 5 * 60 * 1000,
+  approvalTimeoutMs: 10 * 60 * 1000,
 }
 
 const TYPING_MS = 6000
@@ -243,6 +247,13 @@ export function apply(ctx, config = {}) {
     disposed: false,
     queue: Promise.resolve(),
   }
+
+  /** sessionId -> pending ask_user_question entry */
+  const questionBySession = new Map()
+  /** short token -> same pending question entry */
+  const questionByToken = new Map()
+  /** short token -> pending approval entry */
+  const approvalByToken = new Map()
 
   const sayTo = (channel, text, options) => {
     if (!channel || (!text && !options?.embeds)) return Promise.resolve()
@@ -501,6 +512,7 @@ export function apply(ctx, config = {}) {
           '`!show <路径>` 直接在 Discord 里查看 Markdown/文本文件',
           '`!id` 显示本频道绑定的会话',
           '`!here` 当前频道 id',
+          '审批和提问会自动发到本频道，点按钮或直接回复文字即可',
           '`!help` 显示这条帮助',
         ].join('\n'),
       )
@@ -895,6 +907,17 @@ export function apply(ctx, config = {}) {
         await handleCommand(channel, text)
         return
       }
+      const pending = questionBySession.get(bindings.get(channel))
+      if (pending && pending.channel === channel) {
+        if (text) {
+          await answerQuestionByText(pending, text)
+          return
+        }
+        if (rawAttachments.length > 0) {
+          await sayTo(channel, '当前有待回答问题，请先用文字或按钮回答。')
+          return
+        }
+      }
       const parts = await buildInboundParts(text, rawAttachments)
       if (parts.length === 0) {
         if (rawAttachments.length > 0) {
@@ -967,6 +990,14 @@ export function apply(ctx, config = {}) {
         .interactionCallback(data.id, data.token, payload)
         .catch((error) => warn(`interaction callback failed: ${error?.message ?? error}`))
 
+    if (customId.startsWith('q:')) {
+      await handleQuestionInteraction(data, customId, reply)
+      return
+    }
+    if (customId.startsWith('a:')) {
+      await handleApprovalInteraction(data, customId, reply)
+      return
+    }
     if (customId === 'refresh') {
       await reply({ type: 7, data: statusPayload(channel) })
       return
@@ -1061,11 +1092,322 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  // ---- remote questions / approvals ------------------------------------
+
+  function questionAborted(reason) {
+    const error = new Error(`ask_user_question ${reason}`)
+    error.code = 'ASK_ABORTED'
+    return error
+  }
+
+  function questionText(item, index, total) {
+    const parts = []
+    if (item.header) parts.push(`**${item.header}**`)
+    parts.push(`**Q${index + 1}/${total}** ${item.question}`)
+    if (item.detail) parts.push('', item.detail)
+    const options = Array.isArray(item.options) ? item.options : []
+    if (options.length > 0) {
+      parts.push('', ...options.slice(0, 20).map((option, i) => `${i + 1}. ${option.label}`))
+      parts.push('', '点下面的按钮，或直接回复序号/文字。')
+    } else {
+      parts.push('', '直接回复文字作答。')
+    }
+    return parts.join('\n').slice(0, 1900)
+  }
+
+  function questionComponents(entry) {
+    const item = entry.request.questions[entry.index]
+    const options = Array.isArray(item?.options) ? item.options.slice(0, 20) : []
+    if (options.length === 0) return undefined
+    const buttons = options.map((option, index) => ({
+      type: 2,
+      style: 2,
+      label: clip(option.label, 80),
+      custom_id: `q:${entry.token}:${index}`,
+    }))
+    return packRows(buttons)
+  }
+
+  function patchPromptMessage(channel, messageId, content) {
+    if (!channel || !messageId) return Promise.resolve()
+    return rest
+      .request('PATCH', `/channels/${channel}/messages/${messageId}`, { content, components: [] })
+      .catch((error) => warn(`prompt message edit failed: ${error?.message ?? error}`))
+  }
+
+  async function sendQuestionMessage(entry) {
+    const item = entry.request.questions[entry.index]
+    const components = questionComponents(entry)
+    const sent = await rest.sendMessage(
+      entry.channel,
+      questionText(item, entry.index, entry.request.questions.length),
+      components ? { components } : {},
+    )
+    entry.messageId = sent?.[0]?.id
+  }
+
+  function finishQuestion(entry, error) {
+    if (questionBySession.get(entry.sessionId) === entry) questionBySession.delete(entry.sessionId)
+    questionByToken.delete(entry.token)
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.timer = undefined
+    if (entry.onAbort) entry.request.signal?.removeEventListener('abort', entry.onAbort)
+    entry.onAbort = undefined
+    if (error) entry.reject?.(error)
+    else entry.resolve?.({ answers: entry.answers })
+  }
+
+  async function advanceQuestion(entry, answer, options = {}) {
+    entry.answers.push(answer)
+    const note = answer.custom ? `✅ 已回复：${clip(answer.custom, 200)}` : `✅ 已选择：${answer.selected.join('、')}`
+    if (!options.skipEdit) await patchPromptMessage(entry.channel, entry.messageId, note)
+    entry.index += 1
+    if (entry.index >= entry.request.questions.length) {
+      finishQuestion(entry)
+      return
+    }
+    try {
+      await sendQuestionMessage(entry)
+    } catch (error) {
+      finishQuestion(entry, error)
+      await sayTo(entry.channel, `下一个问题没有发出去：${error?.message ?? error}`)
+    }
+  }
+
+  async function answerQuestionByText(entry, text) {
+    const item = entry.request.questions[entry.index]
+    if (!item) return
+    const options = Array.isArray(item.options) ? item.options : []
+    const value = String(text ?? '').trim()
+    if (!value) return
+    const numeric = /^\d+$/.test(value) ? Number(value) - 1 : -1
+    const picked = numeric >= 0 && numeric < options.length ? options[numeric] : options.find((option) => option.label === value)
+    const answer = picked
+      ? { id: item.id, selected: [picked.label] }
+      : { id: item.id, selected: [], custom: value }
+    await advanceQuestion(entry, answer)
+  }
+
+  async function askViaDiscord(request, next) {
+    if (!cfg.relayQuestions) return next()
+    const sessionId = request?.agent?.id
+    if (!sessionId || request?.signal?.aborted) return next()
+    const channel = channelsBoundTo(sessionId)[0]
+    if (!channel) return next()
+
+    const previous = questionBySession.get(sessionId)
+    if (previous) {
+      questionBySession.delete(sessionId)
+      questionByToken.delete(previous.token)
+      if (previous.onAbort) previous.request.signal?.removeEventListener('abort', previous.onAbort)
+      void patchPromptMessage(previous.channel, previous.messageId, '⚠️ 已被新的提问替换')
+      previous.reject?.(questionAborted('superseded by a new question'))
+    }
+
+    const token = randomUUID().slice(0, 12)
+    let resolvePromise
+    let rejectPromise
+    const answerPromise = new Promise((resolve, reject) => {
+      resolvePromise = resolve
+      rejectPromise = reject
+    })
+    const entry = {
+      token,
+      sessionId,
+      channel,
+      request,
+      index: 0,
+      answers: [],
+      messageId: undefined,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      onAbort: undefined,
+      timer: undefined,
+    }
+    questionBySession.set(sessionId, entry)
+    questionByToken.set(token, entry)
+
+    if (request.signal) {
+      entry.onAbort = () => {
+        if (questionBySession.get(sessionId) !== entry) return
+        questionBySession.delete(sessionId)
+        questionByToken.delete(token)
+        void patchPromptMessage(channel, entry.messageId, '⚠️ 提问已取消')
+        rejectPromise(questionAborted('cancelled'))
+      }
+      request.signal.addEventListener('abort', entry.onAbort, { once: true })
+    }
+
+    try {
+      await sendQuestionMessage(entry)
+    } catch (error) {
+      questionBySession.delete(sessionId)
+      questionByToken.delete(token)
+      if (entry.onAbort) request.signal?.removeEventListener('abort', entry.onAbort)
+      warn(`question delivery failed; falling back to local UI: ${error?.message ?? error}`)
+      return next()
+    }
+    entry.timer = setTimeout(() => {
+      if (questionBySession.get(sessionId) !== entry) return
+      void patchPromptMessage(channel, entry.messageId, '⏰ 提问超时，请在 DSH 本地重新发起')
+      finishQuestion(entry, questionAborted('timed out'))
+    }, cfg.questionTimeoutMs)
+    entry.timer.unref?.()
+    return await answerPromise
+  }
+
+  async function handleQuestionInteraction(data, customId, reply) {
+    const [, token, rawIndex] = customId.split(':')
+    const entry = questionByToken.get(token)
+    if (!entry || entry.channel !== data.channel_id) {
+      await reply({ type: 4, data: { content: '这个问题已经过期。', flags: 64 } })
+      return
+    }
+    const item = entry.request.questions[entry.index]
+    const index = Number(rawIndex)
+    const label = item?.options?.[index]?.label
+    if (!label) {
+      await reply({ type: 4, data: { content: '这个选项已经失效。', flags: 64 } })
+      return
+    }
+    await reply({ type: 7, data: { content: `✅ 已选择：${label}`, components: [] } })
+    await advanceQuestion(entry, { id: item.id, selected: [label] }, { skipEdit: true })
+  }
+
+  function approvalText(request) {
+    const reason = request.displayReason?.zh ?? request.displayReason?.en ?? request.reason ?? ''
+    return [
+      `🔐 **需要审批：${request.toolName}**`,
+      reason,
+      '',
+      '允许或拒绝这次操作。',
+    ]
+      .filter((line) => line !== '')
+      .join('\n')
+      .slice(0, 1900)
+  }
+
+  function settleApproval(entry, outcome) {
+    if (!approvalByToken.has(entry.token)) return
+    approvalByToken.delete(entry.token)
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.timer = undefined
+    if (entry.onAbort) entry.request.signal?.removeEventListener('abort', entry.onAbort)
+    entry.onAbort = undefined
+    const label =
+      outcome === 'allowed-once' ? '✅ 已允许' : outcome === 'rejected' ? '❌ 已拒绝' : '⏹ 已取消'
+    void patchPromptMessage(entry.channel, entry.messageId, label)
+    entry.resolve(outcome)
+  }
+
+  async function relayApproval(request, next) {
+    if (!cfg.relayApprovals) return next()
+    const sessionId = request?.agent?.id
+    if (!sessionId || request?.signal?.aborted) return next()
+    const channel = channelsBoundTo(sessionId)[0]
+    if (!channel) return next()
+
+    const token = randomUUID().slice(0, 12)
+    let resolveDecision
+    const decision = new Promise((resolve) => {
+      resolveDecision = resolve
+    })
+    const entry = {
+      token,
+      channel,
+      messageId: undefined,
+      request,
+      resolve: resolveDecision,
+      onAbort: undefined,
+      timer: undefined,
+    }
+    approvalByToken.set(token, entry)
+
+    if (request.signal) {
+      entry.onAbort = () => settleApproval(entry, 'cancelled')
+      request.signal.addEventListener('abort', entry.onAbort, { once: true })
+    }
+
+    try {
+      const sent = await rest.sendMessage(channel, approvalText(request), {
+        components: [
+          {
+            type: 1,
+            components: [
+              { type: 2, style: 3, label: '允许', custom_id: `a:${token}:allow` },
+              { type: 2, style: 4, label: '拒绝', custom_id: `a:${token}:deny` },
+            ],
+          },
+        ],
+      })
+      entry.messageId = sent?.[0]?.id
+    } catch (error) {
+      approvalByToken.delete(token)
+      if (entry.onAbort) request.signal?.removeEventListener('abort', entry.onAbort)
+      warn(`approval delivery failed; falling back to local UI: ${error?.message ?? error}`)
+      return next()
+    }
+    entry.timer = setTimeout(() => {
+      if (approvalByToken.get(token) === entry) settleApproval(entry, 'cancelled')
+    }, cfg.approvalTimeoutMs)
+    entry.timer.unref?.()
+    return await decision
+  }
+
+  async function handleApprovalInteraction(data, customId, reply) {
+    const [, token, decision] = customId.split(':')
+    const entry = approvalByToken.get(token)
+    if (!entry || entry.channel !== data.channel_id) {
+      await reply({ type: 4, data: { content: '这个审批已经过期。', flags: 64 } })
+      return
+    }
+    if (decision !== 'allow' && decision !== 'deny') {
+      await reply({ type: 4, data: { content: '未知审批选项。', flags: 64 } })
+      return
+    }
+    await reply({ type: 4, data: { content: decision === 'allow' ? '已允许。' : '已拒绝。', flags: 64 } })
+    settleApproval(entry, decision === 'allow' ? 'allowed-once' : 'rejected')
+  }
+
   // ---- lifecycle -------------------------------------------------------
 
   ctx.effect(() => {
     const offEvent = ctx.on('session/event', onSessionEvent)
     const offStatus = ctx.on('agent/status', onStatus)
+
+    // Prefer wrapping the service entry point (the same seam the QQ bridge
+    // uses) so this works on DSH versions where the scoped waterfall is not
+    // visible to a root plugin. Fall back to the waterfall event otherwise.
+    let restoreQuestionAsk
+    try {
+      const userQuestions = ctx.get('userQuestions')
+      if (userQuestions && typeof userQuestions.ask === 'function' && !userQuestions.__discordBridgePatched) {
+        const originalAsk = userQuestions.ask.bind(userQuestions)
+        userQuestions.ask = (request) => askViaDiscord(request, () => originalAsk(request))
+        Object.defineProperty(userQuestions, '__discordBridgePatched', { value: true, configurable: true })
+        restoreQuestionAsk = () => {
+          if (userQuestions.__discordBridgePatched) {
+            userQuestions.ask = originalAsk
+            delete userQuestions.__discordBridgePatched
+          }
+        }
+      }
+    } catch {
+      restoreQuestionAsk = undefined
+    }
+
+    const offQuestion = restoreQuestionAsk
+      ? undefined
+      : ctx.on(
+          'user-questions/request',
+          (request, next) => askViaDiscord(request, next),
+          { prepend: true },
+        )
+    const offApproval = ctx.on(
+      'approval/request',
+      (request, next) => relayApproval(request, next),
+      { prepend: true },
+    )
     const gateway = new DiscordGateway({
       token: cfg.botToken,
       intents: INTENTS.GUILDS | INTENTS.GUILD_MESSAGES | INTENTS.DIRECT_MESSAGES | INTENTS.MESSAGE_CONTENT,
@@ -1134,6 +1476,15 @@ export function apply(ctx, config = {}) {
       for (const channel of [...state.typing.keys()]) stopTyping(channel)
       offEvent()
       offStatus()
+      restoreQuestionAsk?.()
+      offQuestion?.()
+      offApproval?.()
+      for (const entry of [...questionBySession.values()]) {
+        finishQuestion(entry, questionAborted('bridge disposed'))
+      }
+      for (const entry of [...approvalByToken.values()]) {
+        settleApproval(entry, 'cancelled')
+      }
       void gateway.close()
       for (const handle of state.created.values()) void handle.dispose?.().catch?.(() => undefined)
       for (const handle of state.resumed.values()) void handle.dispose?.().catch?.(() => undefined)
