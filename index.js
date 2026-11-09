@@ -16,10 +16,10 @@
  * @module dsh-discord-bridge
  */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
-import { DiscordGateway, DiscordRest, INTENTS, downloadAttachment } from './discord.js'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { DiscordGateway, DiscordRest, INTENTS, chunkText, downloadAttachment } from './discord.js'
 
 export const name = 'discord-bridge'
 export const inject = ['agents']
@@ -49,6 +49,37 @@ const DEFAULTS = {
 const TYPING_MS = 6000
 const MAX_BUTTONS = 20
 const EMBED_COLOR = 0x5865f2
+
+/** Discord's unboosted upload ceiling is 10 MiB; leave room for multipart overhead. */
+const UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024 - 64 * 1024
+const TEXT_FILE_EXTENSIONS = new Set(['.md', '.markdown', '.txt', '.srt', '.log', '.json', '.yaml', '.yml', '.csv'])
+const MIME_BY_EXTENSION = new Map([
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.gif', 'image/gif'],
+  ['.mp4', 'video/mp4'],
+  ['.webm', 'video/webm'],
+  ['.mov', 'video/quicktime'],
+  ['.md', 'text/markdown'],
+  ['.markdown', 'text/markdown'],
+  ['.txt', 'text/plain'],
+  ['.srt', 'text/plain'],
+  ['.json', 'application/json'],
+  ['.yaml', 'text/yaml'],
+  ['.yml', 'text/yaml'],
+  ['.csv', 'text/csv'],
+  ['.pdf', 'application/pdf'],
+])
+
+function contentTypeFor(name) {
+  return MIME_BY_EXTENSION.get(extname(String(name ?? '')).toLowerCase()) ?? 'application/octet-stream'
+}
+
+function isTextFile(name) {
+  return TEXT_FILE_EXTENSIONS.has(extname(String(name ?? '')).toLowerCase())
+}
 
 /** Slash commands registered into the guild on connect. */
 const SLASH_COMMANDS = [
@@ -466,6 +497,8 @@ export function apply(ctx, config = {}) {
           '`!archive` 归档本频道绑定的会话（删频道不会删会话）',
           '`!unbind` 解除本频道绑定',
           '`!stop` 停止本频道绑定的会话正在跑的这一轮',
+          '`!file <路径>` 把工作区里的图片/视频/文件传到 Discord（≤10MB）',
+          '`!show <路径>` 直接在 Discord 里查看 Markdown/文本文件',
           '`!id` 显示本频道绑定的会话',
           '`!here` 当前频道 id',
           '`!help` 显示这条帮助',
@@ -504,6 +537,16 @@ export function apply(ctx, config = {}) {
 
     if (verb === 'new') {
       await handleNew(channel, arg)
+      return
+    }
+
+    if (verb === 'file') {
+      await handleFile(channel, arg)
+      return
+    }
+
+    if (verb === 'show') {
+      await handleShow(channel, arg)
       return
     }
 
@@ -740,6 +783,99 @@ export function apply(ctx, config = {}) {
       return
     }
     if (cfg.replyToPrompt) await sayTo(channel, `→ 已交给 ${describe(agent)}`, { replyTo: messageId })
+  }
+
+  /** Resolve a user-supplied path inside the bound session's workspace. */
+  function resolveWorkspacePath(agent, input) {
+    const raw = String(input ?? '').trim().replace(/^["']|["']$/g, '')
+    if (!raw) throw new Error('缺少文件路径')
+    const root = realpathSync(resolve(agent?.session?.header?.cwd || cfg.newSessionCwd || process.cwd()))
+    const target = isAbsolute(raw) ? resolve(raw) : resolve(root, raw)
+    const real = realpathSync(target)
+    const rel = relative(root, real)
+    if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('只能访问当前会话工作区内的文件')
+    return real
+  }
+
+  async function boundAgentForFiles(channel) {
+    const sessionId = bindings.get(channel)
+    if (!sessionId) return undefined
+    return await ensureAgent(sessionId)
+  }
+
+  async function handleFile(channel, arg) {
+    const agent = await boundAgentForFiles(channel)
+    if (!agent) {
+      await sayTo(channel, '这个频道还没有绑定会话：先发 `!status` 选一个，或 `!new`。')
+      return
+    }
+    let filePath
+    try {
+      filePath = resolveWorkspacePath(agent, arg)
+    } catch (error) {
+      await sayTo(channel, `找不到文件：${error?.message ?? error}`)
+      return
+    }
+    let info
+    try {
+      info = statSync(filePath)
+    } catch (error) {
+      await sayTo(channel, `读不到文件：${error?.message ?? error}`)
+      return
+    }
+    if (!info.isFile()) {
+      await sayTo(channel, `这不是一个文件：\`${arg}\``)
+      return
+    }
+    if (info.size > UPLOAD_LIMIT_BYTES) {
+      const mb = (info.size / 1024 / 1024).toFixed(1)
+      await sayTo(channel, `文件 ${mb} MB，超过 Discord 当前 10 MB 上传上限。可以压缩/转码后再发。`)
+      return
+    }
+    const name = basename(filePath)
+    try {
+      const data = readFileSync(filePath)
+      await rest.upload(channel, { name, contentType: contentTypeFor(name), data }, `📎 ${name}`)
+      log(`uploaded ${name} (${data.length}B) to ${channel}`)
+    } catch (error) {
+      await sayTo(channel, `上传失败：${error?.message ?? error}`)
+    }
+  }
+
+  async function handleShow(channel, arg) {
+    const agent = await boundAgentForFiles(channel)
+    if (!agent) {
+      await sayTo(channel, '这个频道还没有绑定会话：先发 `!status` 选一个，或 `!new`。')
+      return
+    }
+    let filePath
+    try {
+      filePath = resolveWorkspacePath(agent, arg)
+    } catch (error) {
+      await sayTo(channel, `找不到文件：${error?.message ?? error}`)
+      return
+    }
+    if (!isTextFile(filePath)) {
+      await sayTo(channel, '`!show` 只支持 Markdown/文本文件；图片、视频请用 `!file`。')
+      return
+    }
+    let info
+    try {
+      info = statSync(filePath)
+    } catch (error) {
+      await sayTo(channel, `读不到文件：${error?.message ?? error}`)
+      return
+    }
+    if (info.size > 512 * 1024) {
+      await sayTo(channel, '文本文件超过 512KB，建议用 `!file` 上传后查看，或先精简内容。')
+      return
+    }
+    const text = readFileSync(filePath, 'utf8')
+    if (!text.trim()) {
+      await sayTo(channel, '文件是空的。')
+      return
+    }
+    for (const chunk of chunkText(text, 1900)) await sayTo(channel, chunk)
   }
 
   async function onMessage(data) {

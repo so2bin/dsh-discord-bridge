@@ -131,6 +131,24 @@ bot 会列出当前 DSH 会话。点击按钮，或按提示发：
 
 模型能不能看懂图片取决于当前会话模型是否支持视觉；纯文本模型只能拿到图片占位信息。
 
+Discord 入站目前只处理图片；PDF / zip / 视频等附件不会自动进入 DSH。需要把远程文件发到手机时，用下面的 `!file`。
+
+## 查看 / 分享生成的文件
+
+在绑定会话的频道里，可以直接把远程机器上生成的文件发到 Discord：
+
+```text
+!file color-secrets-class/animation/film/out/v4-paper-voice.mp4
+!file color-secrets-class/animation/film/out/compare-v4.png
+!show color-secrets-class/README.md
+```
+
+- `!file <路径>`：把工作区里的文件上传成 Discord 附件。图片和视频会直接内嵌预览，手机端点开即可在线看，不会先下载到相册；PDF、压缩包等也可以发，但会显示为附件。
+- `!show <路径>`：把 Markdown / 文本内容直接发到聊天里，适合看完就关的场景。
+- 路径相对当前会话的工作区；不能访问工作区外的文件。
+- 当前按 Discord 未加成服务器的 **10 MB** 上传上限处理；超过会提示先压缩或转码。
+- Discord 不渲染 Markdown 表格，`!show` 表格会以原始竖线文本显示。
+
 ### 常用命令
 
 | 命令 | 作用 |
@@ -139,6 +157,8 @@ bot 会列出当前 DSH 会话。点击按钮，或按提示发：
 | `!use <序号或 id 前缀>` | 把当前频道绑到指定会话 |
 | `!new [首条指令]` | 新建会话并绑定当前频道 |
 | `!sync` / `!unsync` | 开 / 关专属频道同步 |
+| `!file <路径>` | 上传工作区文件；图片/视频在线预览 |
+| `!show <路径>` | 在聊天里查看 Markdown / 文本 |
 | `!archive` | 归档当前频道绑定的会话 |
 | `!unbind` | 解除当前频道的绑定 |
 | `!id` | 查看当前频道绑定的会话 id |

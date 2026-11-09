@@ -131,6 +131,24 @@ Send a PNG / JPEG / WebP / GIF directly in Discord, with or without text. The im
 
 Whether the model can understand the image depends on the model used by that session. Text-only models only receive placeholder information.
 
+Inbound Discord messages currently handle images only; PDF / zip / video attachments are not forwarded into DSH automatically. Use `!file` below to send remote files to your phone.
+
+## View / share generated files
+
+In a channel bound to a session, send files from the remote machine to Discord:
+
+```text
+!file color-secrets-class/animation/film/out/v4-paper-voice.mp4
+!file color-secrets-class/animation/film/out/compare-v4.png
+!show color-secrets-class/README.md
+```
+
+- `!file <path>` uploads a workspace file as a Discord attachment. Images and videos are previewed inline, so you can watch them on your phone without saving them to the gallery first. PDFs, archives, and other files are sent as attachments too.
+- `!show <path>` posts Markdown / text content directly into the chat, which is convenient for read-and-close.
+- Paths are relative to the bound session workspace; files outside the workspace are rejected.
+- The current limit follows Discord's **10 MB** upload cap for unboosted servers; larger files are refused with a hint to compress or transcode.
+- Discord does not render Markdown tables; `!show` displays them as raw pipe-separated text.
+
 ### Commands
 
 | Command | Purpose |
@@ -139,6 +157,8 @@ Whether the model can understand the image depends on the model used by that ses
 | `!use <index or id prefix>` | Bind this channel to a session |
 | `!new [first prompt]` | Create a session and bind this channel |
 | `!sync` / `!unsync` | Enable / disable a dedicated channel |
+| `!file <path>` | Upload a workspace file; images/videos preview inline |
+| `!show <path>` | View Markdown / text in chat |
 | `!archive` | Archive the session bound to this channel |
 | `!unbind` | Unbind this channel |
 | `!id` | Show the bound session id |

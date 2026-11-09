@@ -8,6 +8,7 @@
  * @module dsh-discord-bridge/discord
  */
 import https from 'node:https'
+import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
 import { HttpsProxyAgent } from 'https-proxy-agent'
 
@@ -201,6 +202,96 @@ export class DiscordRest {
 
   modifyChannel(channelId, patch) {
     return this.request('PATCH', `/channels/${channelId}`, patch)
+  }
+
+  /**
+   * Upload one file as a Discord message attachment.
+   *
+   * The caller owns workspace/path validation and the size limit. This method
+   * only serializes the multipart body and shares the REST queue.
+   *
+   * @param {string} channelId
+   * @param {{ name: string, contentType?: string, data: Buffer }} file
+   * @param {string} [content]
+   */
+  upload(channelId, file, content = '') {
+    const run = async (attempt = 0) => {
+      const boundary = `----dshBridge${randomUUID().replace(/-/g, '')}`
+      const filename = String(file.name || 'file').replace(/["\r\n]/g, '_')
+      const payload = JSON.stringify({
+        content: content || '',
+        attachments: [{ id: 0, filename }],
+      })
+      const head = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n` +
+          `Content-Type: application/json\r\n\r\n${payload}\r\n`,
+        'utf8',
+      )
+      const fileHead = Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="files[0]"; filename="${filename}"\r\n` +
+          `Content-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`,
+        'utf8',
+      )
+      const tail = Buffer.from(`\r\n--${boundary}--\r\n`, 'utf8')
+      const body = Buffer.concat([head, fileHead, file.data, tail])
+
+      return await new Promise((resolve, reject) => {
+        const req = https.request(
+          `${API}/channels/${channelId}/messages`,
+          {
+            method: 'POST',
+            agent: this.#agent,
+            headers: {
+              authorization: `Bot ${this.#token}`,
+              'content-type': `multipart/form-data; boundary=${boundary}`,
+              'user-agent': 'DiscordBot (dsh-discord-bridge, 0.1.0)',
+              'content-length': body.length,
+            },
+            timeout: 60000,
+          },
+          (res) => {
+            const chunks = []
+            res.on('data', (chunk) => chunks.push(chunk))
+            res.on('end', () => {
+              const text = Buffer.concat(chunks).toString('utf8')
+              if (res.statusCode === 429 && attempt < 2) {
+                let waitMs = 2000
+                try {
+                  const parsed = JSON.parse(text)
+                  if (typeof parsed.retry_after === 'number') waitMs = Math.ceil(parsed.retry_after * 1000) + 250
+                } catch {
+                  /* keep the default wait */
+                }
+                setTimeout(() => run(attempt + 1).then(resolve, reject), Math.min(waitMs, 30000))
+                return
+              }
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                try {
+                  return resolve(JSON.parse(text))
+                } catch {
+                  return resolve(text)
+                }
+              }
+              reject(new Error(`discord upload ${channelId} -> ${res.statusCode} ${text.slice(0, 300)}`))
+            })
+          },
+        )
+        req.on('timeout', () => req.destroy(new Error('discord upload timed out')))
+        req.on('error', reject)
+        req.write(body)
+        req.end()
+      })
+    }
+
+    const next = this.#queue.then(
+      () => run(0),
+      () => run(0),
+    )
+    this.#queue = next.then(
+      () => undefined,
+      () => undefined,
+    )
+    return next
   }
 
   deleteChannel(channelId) {
