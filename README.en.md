@@ -85,6 +85,7 @@ Common options:
 | `newSessionCwd` | Working directory for sessions created with `!new` |
 | `autoRename` | Rename a dedicated channel after the session title; default `true` |
 | `relayQuestions` / `relayApprovals` | Forward questions / approvals to Discord; default `true` |
+| `offerFiles` | Detect workspace files in assistant replies and add View buttons; default `true` |
 
 Save the file and restart DSH. When the bot connects, it posts an online notice in `channelId`.
 
@@ -151,6 +152,16 @@ In a channel bound to a session, send files from the remote machine to Discord:
 - Paths are relative to the bound session workspace; files outside the workspace are rejected.
 - The current limit follows Discord's **10 MB** upload cap for unboosted servers; larger files are refused with a hint to compress or transcode.
 - Discord does not render Markdown tables; `!show` displays them as raw pipe-separated text.
+
+## Automatic file buttons
+
+You do not have to remember paths. When an assistant reply mentions a workspace file (Markdown link, backticked path, or bare path), the bridge adds a row of **View** buttons below the reply.
+
+- Nothing is uploaded until you click; files never flood the channel automatically.
+- Images and videos up to 10 MB open inline in Discord.
+- Markdown/text opens directly in the chat.
+- Only files that exist inside the bound session workspace and are ≤10 MB are listed, up to 10 per reply.
+- Set `offerFiles: false` to disable; `!file` / `!show` remain available.
 
 ## Remote questions and approvals
 

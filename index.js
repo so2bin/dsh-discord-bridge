@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { DiscordGateway, DiscordRest, INTENTS, chunkText, downloadAttachment } from './discord.js'
 
 export const name = 'discord-bridge'
@@ -46,6 +47,7 @@ const DEFAULTS = {
   label: 'DSH',
   relayQuestions: true,
   relayApprovals: true,
+  offerFiles: true,
   questionTimeoutMs: 5 * 60 * 1000,
   approvalTimeoutMs: 10 * 60 * 1000,
 }
@@ -84,6 +86,50 @@ function contentTypeFor(name) {
 function isTextFile(name) {
   return TEXT_FILE_EXTENSIONS.has(extname(String(name ?? '')).toLowerCase())
 }
+
+const FILE_REFERENCE_EXTENSIONS =
+  /\.(?:png|jpe?g|webp|gif|mp4|webm|mov|md|markdown|txt|srt|pdf|json|csv|ya?ml|log|zip)\b/i
+
+/**
+ * Pull local file references out of an assistant reply.
+ *
+ * Handles Markdown links, backticked paths, Windows paths, and bare relative
+ * paths. HTTP(S) links are deliberately ignored: Discord already makes those
+ * clickable. Existence/workspace checks happen later, so this stays pure.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function extractFileReferences(text) {
+  const source = String(text ?? '')
+  const found = new Set()
+
+  const add = (raw) => {
+    let value = String(raw ?? '').trim()
+    if (!value) return
+    value = value.replace(/^[<("'`]+|[>"'`]+$/g, '').replace(/[.,;:!?]+$/g, '')
+    if (!value) return
+    if (/^https?:\/\//i.test(value)) return
+    if (value.startsWith('file://')) {
+      try {
+        value = fileURLToPath(value)
+      } catch {
+        return
+      }
+    }
+    if (!FILE_REFERENCE_EXTENSIONS.test(value)) return
+    found.add(value)
+  }
+
+  for (const match of source.matchAll(/\[[^\]]*\]\(([^)]+)\)/g)) add(match[1])
+  for (const match of source.matchAll(/`([^`\n]+)`/g)) add(match[1])
+
+  const bare = /(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/)?[^\s"'`<>|*?]+\.(?:png|jpe?g|webp|gif|mp4|webm|mov|md|markdown|txt|srt|pdf|json|csv|ya?ml|log|zip)\b/gi
+  for (const match of source.matchAll(bare)) add(match[0])
+
+  return [...found]
+}
+
 
 /** Slash commands registered into the guild on connect. */
 const SLASH_COMMANDS = [
@@ -254,6 +300,8 @@ export function apply(ctx, config = {}) {
   const questionByToken = new Map()
   /** short token -> pending approval entry */
   const approvalByToken = new Map()
+  /** short token -> clicked file offer */
+  const fileOffers = new Map()
 
   const sayTo = (channel, text, options) => {
     if (!channel || (!text && !options?.embeds)) return Promise.resolve()
@@ -890,6 +938,145 @@ export function apply(ctx, config = {}) {
     for (const chunk of chunkText(text, 1900)) await sayTo(channel, chunk)
   }
 
+  function fileKind(name) {
+    const ext = extname(String(name ?? '')).toLowerCase()
+    if (['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(ext)) return 'image'
+    if (['.mp4', '.webm', '.mov'].includes(ext)) return 'video'
+    if (isTextFile(name)) return 'text'
+    return 'file'
+  }
+
+  function fileIcon(kind) {
+    return kind === 'image' ? '🖼️' : kind === 'video' ? '🎬' : kind === 'text' ? '📄' : '📎'
+  }
+
+  function pruneFileOffers() {
+    const cutoff = Date.now() - 60 * 60 * 1000
+    for (const [token, offer] of fileOffers) {
+      if (offer.createdAt < cutoff) fileOffers.delete(token)
+    }
+  }
+
+  /**
+   * Scan one assistant reply for existing workspace files and attach a row of
+   * view buttons. Nothing is uploaded until the user clicks.
+   */
+  async function offerFiles(sessionId, text, channels) {
+    if (!cfg.offerFiles || channels.length === 0) return
+    const references = extractFileReferences(text)
+    if (references.length === 0) return
+    const agent = ctx.agents.get(sessionId)
+    if (!agent) return
+    pruneFileOffers()
+
+    let root
+    try {
+      root = realpathSync(resolve(agent?.session?.header?.cwd || cfg.newSessionCwd || process.cwd()))
+    } catch {
+      return
+    }
+
+    const files = []
+    for (const reference of references) {
+      if (files.length >= 10) break
+      let filePath
+      try {
+        filePath = resolveWorkspacePath(agent, reference)
+      } catch {
+        continue
+      }
+      let info
+      try {
+        info = statSync(filePath)
+      } catch {
+        continue
+      }
+      if (!info.isFile() || info.size > UPLOAD_LIMIT_BYTES) continue
+      if (files.some((file) => file.path === filePath)) continue
+      files.push({
+        path: filePath,
+        name: basename(filePath),
+        size: info.size,
+        kind: fileKind(filePath),
+      })
+    }
+    if (files.length === 0) return
+
+    for (const channel of channels) {
+      const token = randomUUID().slice(0, 10)
+      const buttons = files.map((file, index) => ({
+        type: 2,
+        style: 2,
+        label: clip(`${fileIcon(file.kind)} ${file.name}`, 80),
+        custom_id: `f:${token}:${index}`,
+      }))
+      try {
+        await rest.sendMessage(channel, `📂 这条回复引用了 ${files.length} 个文件，点按钮在线查看：`, {
+          components: packRows(buttons),
+        })
+        fileOffers.set(token, { channel, root, files, createdAt: Date.now() })
+      } catch (error) {
+        warn(`file offer send failed: ${error?.message ?? error}`)
+      }
+    }
+  }
+
+  async function handleFileOfferInteraction(data, customId, reply) {
+    const [, token, rawIndex] = customId.split(':')
+    const offer = fileOffers.get(token)
+    if (!offer || offer.channel !== data.channel_id) {
+      await reply({ type: 4, data: { content: '这个文件按钮已经过期，请重新触发一次回复。', flags: 64 } })
+      return
+    }
+    const file = offer.files[Number(rawIndex)]
+    if (!file) {
+      await reply({ type: 4, data: { content: '找不到这个文件。', flags: 64 } })
+      return
+    }
+    await reply({ type: 4, data: { content: `正在发送 ${file.name}…`, flags: 64 } })
+
+    let info
+    try {
+      info = statSync(file.path)
+    } catch (error) {
+      await sayTo(offer.channel, `文件已经不存在：${error?.message ?? error}`)
+      return
+    }
+    if (!info.isFile()) {
+      await sayTo(offer.channel, `这不是一个文件：${file.name}`)
+      return
+    }
+    if (info.size > UPLOAD_LIMIT_BYTES) {
+      await sayTo(offer.channel, `文件 ${(info.size / 1024 / 1024).toFixed(1)} MB，超过 Discord 10 MB 上限。`)
+      return
+    }
+    const rel = relative(offer.root, file.path)
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      await sayTo(offer.channel, '文件已经不在会话工作区内。')
+      return
+    }
+
+    try {
+      if (file.kind === 'text' && info.size <= 512 * 1024) {
+        const text = readFileSync(file.path, 'utf8')
+        if (!text.trim()) {
+          await sayTo(offer.channel, `文件是空的：${file.name}`)
+          return
+        }
+        for (const chunk of chunkText(text, 1900)) await sayTo(offer.channel, chunk)
+        return
+      }
+      const data = readFileSync(file.path)
+      await rest.upload(
+        offer.channel,
+        { name: file.name, contentType: contentTypeFor(file.name), data },
+        `📎 ${file.name}`,
+      )
+    } catch (error) {
+      await sayTo(offer.channel, `发送失败：${error?.message ?? error}`)
+    }
+  }
+
   async function onMessage(data) {
     if (!data || data.author?.bot) return
     if (state.selfId && data.author?.id === state.selfId) return
@@ -998,6 +1185,10 @@ export function apply(ctx, config = {}) {
       await handleApprovalInteraction(data, customId, reply)
       return
     }
+    if (customId.startsWith('f:')) {
+      await handleFileOfferInteraction(data, customId, reply)
+      return
+    }
     if (customId === 'refresh') {
       await reply({ type: 7, data: statusPayload(channel) })
       return
@@ -1034,7 +1225,11 @@ export function apply(ctx, config = {}) {
       case 'assistant/message': {
         if (!cfg.pushAssistant) return
         const text = blockText(event.data?.message?.content)
-        if (text) broadcast(text)
+        if (text) {
+          broadcast(text)
+          const afterText = state.queue.then(() => offerFiles(session.id, text, channels))
+          state.queue = afterText.catch(() => undefined)
+        }
         return
       }
       case 'tool/call': {

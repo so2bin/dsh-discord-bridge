@@ -1,6 +1,6 @@
 {
   "name": "dsh-discord-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Bidirectional Discord bridge for DeepSeek Harness (DSH): mirror a Harness session into a Discord channel, send instructions from your phone, and receive inbound images as real DSH attachments.",
   "icon": "./icon.svg",
   "license": "MIT",
