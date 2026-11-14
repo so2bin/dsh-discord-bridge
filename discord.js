@@ -377,9 +377,26 @@ export class DiscordGateway {
 
   async connect() {
     const rest = new DiscordRest({ token: this.#token, proxy: this.#proxy })
-    const info = await rest.gatewayUrl()
-    this.#resumeUrl = info.url
-    return this.#open(`${info.url}/?v=10&encoding=json`)
+    let delay = 1000
+    // DSH can start before the proxy/network is ready. Gateway discovery is a
+    // REST call; retry it instead of giving up permanently on the first failure.
+    for (;;) {
+      if (this.#disposed) throw new Error('discord gateway disposed')
+      try {
+        const info = await rest.gatewayUrl()
+        this.#resumeUrl = info.url
+        return this.#open(`${info.url}/?v=10&encoding=json`)
+      } catch (error) {
+        this.#log(
+          `gateway lookup failed: ${error instanceof Error ? error.message : String(error)}; retrying in ${delay}ms`,
+        )
+        await new Promise((resolve) => {
+          const timer = setTimeout(resolve, delay)
+          timer.unref?.()
+        })
+        delay = Math.min(delay * 2, 30000)
+      }
+    }
   }
 
   #open(url) {

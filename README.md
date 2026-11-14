@@ -196,6 +196,7 @@ Discord 入站目前只处理图片；PDF / zip / 视频等附件不会自动进
 - 确认已经打开 `MESSAGE CONTENT INTENT`；
 - 确认 bot 有 `View Channels`、`Send Messages`、`Read Message History` 权限；
 - 如果配置了代理，确认代理可用；
+- 如果 DSH 比代理先启动，bridge 会自动重试（最长 30 秒一次），代理恢复后会发上线消息；
 - 如果填了 `allowUserIds` / `allowChannelIds`，确认你的 ID 在白名单里。
 
 **`!status` 有响应，但普通消息不回复**
