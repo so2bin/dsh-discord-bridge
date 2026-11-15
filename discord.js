@@ -361,6 +361,7 @@ export class DiscordGateway {
   #heartbeat
   #awaitingAck = false
   #retry = 0
+  #reconnectTimer
   #disposed = false
   #ready = null
 
@@ -379,14 +380,13 @@ export class DiscordGateway {
   async connect() {
     const rest = new DiscordRest({ token: this.#token, proxy: this.#proxy })
     let delay = 1000
-    // DSH can start before the proxy/network is ready. Gateway discovery is a
-    // REST call; retry it instead of giving up permanently on the first failure.
+    // DSH can start before the proxy/network is ready, and a wake-up can break
+    // both discovery and the handshake. Keep retrying until a socket is live.
     for (;;) {
       if (this.#disposed) throw new Error('discord gateway disposed')
+      let info
       try {
-        const info = await rest.gatewayUrl()
-        this.#resumeUrl = info.url
-        return this.#open(`${info.url}/?v=10&encoding=json`)
+        info = await rest.gatewayUrl()
       } catch (error) {
         this.#log(
           `gateway lookup failed: ${error instanceof Error ? error.message : String(error)}; retrying in ${delay}ms`,
@@ -396,6 +396,15 @@ export class DiscordGateway {
           timer.unref?.()
         })
         delay = Math.min(delay * 2, 30000)
+        continue
+      }
+      this.#resumeUrl = info.url
+      try {
+        return await this.#open(`${info.url}/?v=10&encoding=json`)
+      } catch (error) {
+        this.#log(`gateway open failed: ${error instanceof Error ? error.message : String(error)}`)
+        this.#scheduleReconnect()
+        throw error
       }
     }
   }
@@ -428,16 +437,18 @@ export class DiscordGateway {
   }
 
   #scheduleReconnect() {
+    if (this.#disposed || this.#reconnectTimer) return
     const delay = Math.min(30000, 1000 * 2 ** Math.min(this.#retry, 5))
     this.#retry += 1
-    const timer = setTimeout(() => {
+    this.#reconnectTimer = setTimeout(() => {
+      this.#reconnectTimer = undefined
       if (this.#disposed) return
-      const url = this.#resumeUrl ?? 'wss://gateway.discord.gg'
-      this.#open(this.#resumeUrl ? `${url}/?v=10&encoding=json` : `${url}/?v=10&encoding=json`).catch((err) =>
-        this.#log(`reconnect failed: ${err?.message ?? err}`),
-      )
+      this.connect().catch((err) => {
+        this.#log(`reconnect failed: ${err?.message ?? err}`)
+        this.#scheduleReconnect()
+      })
     }, delay)
-    timer.unref?.()
+    this.#reconnectTimer.unref?.()
   }
 
   #send(op, d) {
@@ -505,6 +516,10 @@ export class DiscordGateway {
           this.#sessionId = payload.d.session_id
           this.#resumeUrl = payload.d.resume_gateway_url ?? this.#resumeUrl
           this.#retry = 0
+          if (this.#reconnectTimer) {
+            clearTimeout(this.#reconnectTimer)
+            this.#reconnectTimer = undefined
+          }
           this.#onDispatch('READY', payload.d)
           return
         }
@@ -523,6 +538,10 @@ export class DiscordGateway {
   async close() {
     this.#disposed = true
     this.#awaitingAck = false
+    if (this.#reconnectTimer) {
+      clearTimeout(this.#reconnectTimer)
+      this.#reconnectTimer = undefined
+    }
     clearInterval(this.#heartbeat)
     try {
       this.#ws?.close()
