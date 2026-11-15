@@ -197,6 +197,7 @@ When a bound session calls `ask_user_question` or requests tool approval, the br
 - Make sure the bot has `View Channels`, `Send Messages`, and `Read Message History`;
 - If a proxy is configured, verify it works;
 - If DSH starts before the proxy, the bridge retries every 30 seconds at most and posts an online notice once the proxy is available;
+- After sleep or a network switch, a missed heartbeat forces a reconnect and a fresh online notice;
 - If `allowUserIds` / `allowChannelIds` are set, make sure your ID is included.
 
 **`!status` works but normal messages do nothing**

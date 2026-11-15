@@ -359,6 +359,7 @@ export class DiscordGateway {
   #sessionId = null
   #resumeUrl = null
   #heartbeat
+  #awaitingAck = false
   #retry = 0
   #disposed = false
   #ready = null
@@ -417,6 +418,7 @@ export class DiscordGateway {
     ws.on('close', (code, reason) => {
       clearInterval(this.#heartbeat)
       this.#heartbeat = undefined
+      this.#awaitingAck = false
       if (this.#disposed) return
       this.#log(`gateway closed (${code} ${String(reason || '')})`)
       this.#scheduleReconnect()
@@ -462,13 +464,28 @@ export class DiscordGateway {
       case 10: {
         clearInterval(this.#heartbeat)
         const interval = payload.d.heartbeat_interval
-        this.#heartbeat = setInterval(() => this.#send(1, this.#seq), interval)
+        this.#awaitingAck = true
+        this.#send(1, this.#seq)
+        this.#heartbeat = setInterval(() => {
+          if (this.#awaitingAck) {
+            this.#log('gateway heartbeat ACK missing — forcing reconnect')
+            try {
+              this.#ws?.terminate()
+            } catch {
+              /* close handler still runs */
+            }
+            return
+          }
+          this.#awaitingAck = true
+          this.#send(1, this.#seq)
+        }, interval)
         this.#heartbeat.unref?.()
         if (this.#sessionId) this.#resume()
         else this.#identify()
         break
       }
       case 11:
+        this.#awaitingAck = false
         break
       case 7: {
         this.#log('gateway asked to reconnect')
@@ -505,6 +522,7 @@ export class DiscordGateway {
 
   async close() {
     this.#disposed = true
+    this.#awaitingAck = false
     clearInterval(this.#heartbeat)
     try {
       this.#ws?.close()
