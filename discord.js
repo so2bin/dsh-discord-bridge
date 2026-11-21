@@ -364,6 +364,7 @@ export class DiscordGateway {
   #reconnectTimer
   #disposed = false
   #ready = null
+  #identified = false
 
   constructor({ token, intents, proxy, onDispatch, log }) {
     this.#token = token
@@ -371,6 +372,29 @@ export class DiscordGateway {
     this.#proxy = proxy
     this.#onDispatch = onDispatch
     this.#log = log ?? (() => {})
+  }
+
+  get healthy() {
+    return this.#identified && this.#ws?.readyState === WebSocket.OPEN
+  }
+
+  get hasSocket() {
+    return this.#ws !== undefined
+  }
+
+  /** Used by the plugin watchdog when the socket is present but not READY. */
+  forceReconnect() {
+    if (this.#disposed) return
+    try {
+      this.#ws?.terminate()
+    } catch {
+      try {
+        this.#ws?.close()
+      } catch {
+        /* already gone */
+      }
+    }
+    this.#scheduleReconnect()
   }
 
   get sessionId() {
@@ -413,6 +437,7 @@ export class DiscordGateway {
     const agent = agentFor(this.#proxy)
     const ws = new WebSocket(url, { agent })
     this.#ws = ws
+    this.#identified = false
     this.#ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('discord gateway handshake timed out')), 20000)
       ws.once('open', () => clearTimeout(timer))
@@ -428,6 +453,7 @@ export class DiscordGateway {
       clearInterval(this.#heartbeat)
       this.#heartbeat = undefined
       this.#awaitingAck = false
+      this.#identified = false
       if (this.#disposed) return
       this.#log(`gateway closed (${code} ${String(reason || '')})`)
       this.#scheduleReconnect()
@@ -516,6 +542,7 @@ export class DiscordGateway {
           this.#sessionId = payload.d.session_id
           this.#resumeUrl = payload.d.resume_gateway_url ?? this.#resumeUrl
           this.#retry = 0
+          this.#identified = true
           if (this.#reconnectTimer) {
             clearTimeout(this.#reconnectTimer)
             this.#reconnectTimer = undefined
@@ -538,6 +565,7 @@ export class DiscordGateway {
   async close() {
     this.#disposed = true
     this.#awaitingAck = false
+    this.#identified = false
     if (this.#reconnectTimer) {
       clearTimeout(this.#reconnectTimer)
       this.#reconnectTimer = undefined

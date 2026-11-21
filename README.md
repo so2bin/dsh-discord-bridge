@@ -198,6 +198,7 @@ Discord 入站目前只处理图片；PDF / zip / 视频等附件不会自动进
 - 如果配置了代理，确认代理可用；
 - 如果 DSH 比代理先启动，bridge 会自动重试（最长 30 秒一次），代理恢复后会发上线消息；
 - 电脑睡眠/网络切换后如果心跳失联，bridge 会自动强制重连并发上线消息；
+- 连接日志：`~/.dsh/plugins/dsh-discord-bridge.log`（排查时看最后几行）；
 - 如果填了 `allowUserIds` / `allowChannelIds`，确认你的 ID 在白名单里。
 
 **`!status` 有响应，但普通消息不回复**

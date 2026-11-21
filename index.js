@@ -16,7 +16,7 @@
  * @module dsh-discord-bridge
  */
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -234,8 +234,23 @@ export function apply(ctx, config = {}) {
   // profile file (and can never be committed by accident).
   cfg.botToken = cfg.botToken || process.env.DISCORD_BOT_TOKEN || ''
   cfg.proxy = cfg.proxy || process.env.DISCORD_PROXY || ''
-  const log = (message) => ctx.logger.info(`[discord-bridge] ${message}`)
-  const warn = (message) => ctx.logger.warn(`[discord-bridge] ${message}`)
+  const statusLogPath = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'plugins', 'dsh-discord-bridge.log')
+  const recordStatus = (level, message) => {
+    try {
+      mkdirSync(dirname(statusLogPath), { recursive: true })
+      appendFileSync(statusLogPath, `${new Date().toISOString()} [${level}] ${message}\n`, 'utf8')
+    } catch {
+      /* status logging is best-effort */
+    }
+  }
+  const log = (message) => {
+    recordStatus('info', message)
+    ctx.logger.info(`[discord-bridge] ${message}`)
+  }
+  const warn = (message) => {
+    recordStatus('warn', message)
+    ctx.logger.warn(`[discord-bridge] ${message}`)
+  }
 
   if (!cfg.botToken) {
     warn('botToken is empty — set it in cordis.patch.yml or DISCORD_BOT_TOKEN, then reload the profile.')
@@ -1665,9 +1680,18 @@ export function apply(ctx, config = {}) {
     })
     state.gateway = gateway
     gateway.connect().catch((error) => warn(`gateway connect failed: ${error?.message ?? error}`))
+    const healthTimer = setInterval(() => {
+      if (state.disposed) return
+      if (!gateway.healthy && gateway.hasSocket) {
+        warn('gateway socket is not READY; forcing reconnect')
+        gateway.forceReconnect()
+      }
+    }, 60000)
+    healthTimer.unref?.()
 
     return () => {
       state.disposed = true
+      clearInterval(healthTimer)
       for (const channel of [...state.typing.keys()]) stopTyping(channel)
       offEvent()
       offStatus()
